@@ -73,6 +73,32 @@ function retBps(close: bigint, entryPrice: bigint): number {
   return Number((close * 10_000n) / entryPrice - 10_000n);
 }
 
+// Position-exit decision, extracted from onBatch. Given the sleeve held and
+// the position's current return, best return since entry and bars held,
+// returns true when the position should be sold on this bar. Sleeve A exits
+// on take-profit, hard stop, max hold, or a trailing stop once armed;
+// sleeve B exits on its tighter take-profit / hard stop / max hold only.
+// Pure function of its arguments: no state is read or changed here.
+function shouldExitPosition(
+  sleeve: 'A' | 'B',
+  ret: number,
+  bestRet: number,
+  heldBars: number,
+): boolean {
+  if (sleeve === 'A') {
+    if (ret >= TP_A_BPS) return true;
+    if (ret <= SL_A_BPS) return true;
+    if (heldBars >= MAX_HOLD_A) return true;
+    if (bestRet >= TRAIL_ARM_BPS && ret <= bestRet - TRAIL_GIVEBACK_BPS) return true;
+    return false;
+  }
+  // Sleeve B exits.
+  if (ret >= TP_B_BPS) return true;
+  if (ret <= SL_B_BPS) return true;
+  if (heldBars >= MAX_HOLD_B) return true;
+  return false;
+}
+
 function onBatch(state: BarsState, batch: Batch): OrderInput[] {
   // Fold buy fills into entry / hold bookkeeping first.
   for (const fill of batch.fills) {
@@ -103,23 +129,9 @@ function onBatch(state: BarsState, batch: Batch): OrderInput[] {
     holdBars += 1;
     const ret = retBps(close, entryPrice);
     if (ret > bestRetBps) bestRetBps = ret;
-    let sell = false;
-    if (mode === 'A') {
-      if (
-        ret >= TP_A_BPS ||
-        ret <= SL_A_BPS ||
-        holdBars >= MAX_HOLD_A ||
-        (bestRetBps >= TRAIL_ARM_BPS && ret <= bestRetBps - TRAIL_GIVEBACK_BPS)
-      ) {
-        sell = true;
-      }
-    } else {
-      // Sleeve B exits.
-      if (ret >= TP_B_BPS || ret <= SL_B_BPS || holdBars >= MAX_HOLD_B) {
-        sell = true;
-      }
-    }
-    if (sell) {
+    // mode is set on every buy; fall back to sleeve B exits if it is ever
+    // unset while a position is held, matching the pre-refactor behaviour.
+    if (shouldExitPosition(mode ?? 'B', ret, bestRetBps, holdBars)) {
       return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     // Top-up: a washout signal while holding a B position buys the
